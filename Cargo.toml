@@ -1,0 +1,19 @@
+[package]
+name = "limeade"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+arboard = "3.6.0"
+axum = "0.8.4"
+bytes = "1.10.1"
+clap = { version = "4.5.41", features = ["derive"] }
+env_logger = "0.11.8"
+futures-util = "0.3.31"
+log = "0.4.27"
+reqwest = { version = "0.12.22", features = ["blocking", "json", "stream"] }
+serde = { version = "1.0.219", features = ["derive"] }
+thiserror = "2.0.12"
+tokio = { version = "1.46.1", features = ["io-std", "io-util", "rt", "rt-multi-thread"] }
+tokio-util = "0.7.15"
+url = "2.5.4"
