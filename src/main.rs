@@ -1,17 +1,20 @@
-use std::process::ExitCode;
 use futures_util::TryStreamExt;
 use std::io::Write;
 use tokio_util::io::ReaderStream;
-use bytes::Bytes;
 
+use anyhow::Context;
 use clap::{Args, Parser, Subcommand};
-use log::{error, info, warn};
+use log::{info, warn};
 
 #[derive(Parser, Debug)]
 #[command(version, about)]
 struct Cli {
     #[command(subcommand)]
     cmd: Command,
+
+    /// The server to connect to for client commands.
+    #[arg(long, default_value = "localhost:2490")]
+    server: String,
 
     /// Flags defined for lemonade that don't make sense with a proper subcommand parser.  Keep them for backwards compatability.
     #[command(flatten)]
@@ -49,7 +52,6 @@ struct CompatFlags {
     #[arg(long, global = true, hide = true)]
     trans_localfile: Option<bool>,
 
-
     /// Log Leve (4 = Critical, 0 = Debug)
     #[arg(long, global = true, hide = true)]
     log_level: Option<u8>,
@@ -73,7 +75,7 @@ enum Command {
 }
 
 #[tokio::main]
-async fn main() -> ExitCode {
+async fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
 
     let log_level = match cli.compat_flags.log_level {
@@ -89,39 +91,47 @@ async fn main() -> ExitCode {
         .init();
 
     if let Some(true) = cli.compat_flags.trans_loopback {
-        error!("legacy flag --trans-loopback is not supported in limeade");
-        return ExitCode::from(1);
+        anyhow::bail!("legacy flag --trans-loopback is not supported in limeade");
     }
 
     if let Some(true) = cli.compat_flags.trans_localfile {
-        error!("legacy flag --trans-localfile is not supported in limeade");
-        return ExitCode::from(1);
+        anyhow::bail!("legacy flag --trans-localfile is not supported in limeade");
     }
+
+    // Build server URL based on legacy flags or use --server
+    let server_url = build_server_url(&cli.server, &cli.compat_flags);
 
     match cli.cmd {
         Command::Copy { text } => {
-            let client = limeade::client::Client::new("http://localhost:2490".to_string()).unwrap();
+            let client = limeade::client::Client::new(server_url)
+                .context("Failed to create client")?;
 
             if let Some(text) = text {
-                client.copy(&text).await.unwrap();
+                client.copy(&text).await
+                    .context("Failed to copy text to clipboard")?;
             } else {
                 let stdin = tokio::io::stdin();
                 let stdin = ReaderStream::new(stdin);
-                client.copy_stream(stdin).await.unwrap();
+                client.copy_stream(stdin).await
+                    .context("Failed to copy from stdin to clipboard")?;
             }
         }
         Command::Paste { .. } => {
-            let client = limeade::client::Client::new("http://localhost:2490".to_string()).unwrap();
-            let stream = client.paste_stream().await.unwrap();
-            stream
-                .try_for_each(|chunk: Bytes| async move {
-                    let stdout = std::io::stdout();
-                    let mut handle = stdout.lock();
-                    handle.write_all(&chunk).unwrap();
-                    handle.flush().unwrap();
-                    Ok(())
-                })
-                .await.unwrap();
+            let client = limeade::client::Client::new(server_url)
+                .context("Failed to create client")?;
+            let mut stream = client.paste_stream().await
+                .context("Failed to get clipboard content")?;
+                
+            let stdout = std::io::stdout();
+            let mut handle = stdout.lock();
+            
+            while let Some(chunk) = stream.try_next().await
+                .context("Failed to read from clipboard stream")? {
+                handle.write_all(&chunk)
+                    .context("Failed to write to stdout")?;
+                handle.flush()
+                    .context("Failed to flush stdout")?;
+            }
         }
         Command::Server { mut addr } => {
             if let Some(leagacy_port) = cli.compat_flags.port {
@@ -130,8 +140,24 @@ async fn main() -> ExitCode {
             }
 
             info!("starting server on {addr}");
-            limeade::server::serve().await;
+            limeade::server::serve().await
+                .context("Server failed")?;
         }
     }
-    ExitCode::SUCCESS
+    Ok(())
+}
+
+fn build_server_url(server_addr: &str, compat_flags: &CompatFlags) -> String {
+    match (&compat_flags.host, compat_flags.port) {
+        (Some(host), Some(port)) => format!("http://{}:{}", host, port),
+        (Some(host), None) => format!("http://{}:2490", host),
+        (None, Some(port)) => format!("http://localhost:{}", port),
+        (None, None) => {
+            if server_addr.starts_with("http://") || server_addr.starts_with("https://") {
+                server_addr.to_string()
+            } else {
+                format!("http://{}", server_addr)
+            }
+        }
+    }
 }

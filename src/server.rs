@@ -1,27 +1,73 @@
-use arboard::Clipboard; 
-use axum::{Router};
-use axum::routing::{post, get};
+use arboard::Clipboard;
+use axum::routing::{get, post};
+use axum::{Router, extract::State, http::StatusCode, response::IntoResponse};
+use std::sync::Arc;
+use thiserror::Error;
+use tokio::sync::Mutex;
 
-pub async fn serve() {
-    let app = Router::new().
-        route("/clipboard", post(post_clipboard)).
-        route("/clipboard", get(get_clipboard));
-
-    let listener = tokio::net::TcpListener::bind("0.0.0.0:2490").await.unwrap();
-    axum::serve(listener, app).await.unwrap();
+#[derive(Clone)]
+pub struct AppState {
+    clipboard: Arc<Mutex<Clipboard>>,
 }
 
-
-async fn post_clipboard(data: String) {
-    let mut clipboard = Clipboard::new().unwrap();
-    clipboard.set_text(&data).unwrap();
+impl AppState {
+    pub fn new() -> Result<Self, Error> {
+        let clipboard = Clipboard::new()?;
+        Ok(AppState {
+            clipboard: Arc::new(Mutex::new(clipboard)),
+        })
+    }
 }
 
+#[derive(Error, Debug)]
+pub enum Error {
+    #[error("Failed to create clipboard instance: {0}")]
+    ClipboardInit(#[from] arboard::Error),
 
-async fn get_clipboard() -> String {
-    // TODO: handle errors
-    let mut clipboard = Clipboard::new().unwrap();
-    let contents = clipboard.get_text().unwrap();
-    contents
+    #[error("Failed to access clipboard: {0}")]
+    ClipboardAccess(arboard::Error),
+
+    #[error("Network error: {0}")]
+    Network(#[from] std::io::Error),
 }
 
+impl IntoResponse for Error {
+    fn into_response(self) -> axum::response::Response {
+        let status = match self {
+            Error::ClipboardAccess(arboard::Error::ClipboardOccupied) => {
+                StatusCode::SERVICE_UNAVAILABLE
+            }
+            Error::ClipboardInit(_) | Error::ClipboardAccess(_) => {
+                StatusCode::INTERNAL_SERVER_ERROR
+            }
+            Error::Network(_) => StatusCode::SERVICE_UNAVAILABLE,
+        };
+
+        (status, self.to_string()).into_response()
+    }
+}
+
+pub async fn serve() -> Result<(), Error> {
+    let state = AppState::new()?;
+
+    let app = Router::new()
+        .route("/clipboard", post(post_clipboard))
+        .route("/clipboard", get(get_clipboard))
+        .with_state(state);
+
+    let listener = tokio::net::TcpListener::bind("0.0.0.0:2490").await?;
+    axum::serve(listener, app).await?;
+    Ok(())
+}
+
+async fn post_clipboard(State(state): State<AppState>, data: String) -> Result<StatusCode, Error> {
+    let mut clipboard = state.clipboard.lock().await;
+    clipboard.set_text(&data).map_err(Error::ClipboardAccess)?;
+    Ok(StatusCode::OK)
+}
+
+async fn get_clipboard(State(state): State<AppState>) -> Result<String, Error> {
+    let mut clipboard = state.clipboard.lock().await;
+    let contents = clipboard.get_text().map_err(Error::ClipboardAccess)?;
+    Ok(contents)
+}
